@@ -1,0 +1,212 @@
+name: sdlc:provision
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_api_url:
+        description: "App API URL"
+        type: string
+        required: true
+      cli_version:
+        description: "sdlc CLI release tag"
+        type: string
+        required: true
+      scr_version:
+        description: "sdlc-components-run release tag"
+        type: string
+        required: true
+      scb_version:
+        description: "sdlc-components-build release tag"
+        type: string
+        required: true
+      component_commits:
+        description: 'Per-component repo + commit to pin (JSON: {"<component>":{"repo_owner":"","repo_name":"","commit":""}})'
+        type: string
+        required: true
+      infra_code_components:
+        description: "Infra-code component names (JSON array, e.g. [@infra,@infra-components])"
+        type: string
+        required: false
+        default: '[]'
+      project_name:
+        description: "Project Name"
+        type: string
+        required: true
+      branch_name:
+        description: "Branch Name"
+        type: string
+        required: true
+
+permissions:
+  actions: write
+  contents: write
+  deployments: write
+  pull-requests: write
+  packages: write
+
+jobs:
+  provision:
+    name: SDLC Provision
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Job Parameters
+        run: |
+          echo 'Run ID: ${{ github.run_id }}'
+          echo 'App API URL: ${{ github.event.inputs.app_api_url }}'
+          echo 'CLI Version: ${{ github.event.inputs.cli_version }}'
+          echo 'SCR Version: ${{ github.event.inputs.scr_version }}'
+          echo 'SCB Version: ${{ github.event.inputs.scb_version }}'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.2"
+
+      - name: Install sdlc CLI
+        run: |
+          set -euo pipefail
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; esac
+          BINARY_NAME="cli-${OS}-${ARCH}"
+          mkdir -p "$HOME/.local/bin"
+          curl -fL --retry 6 --retry-all-errors --retry-delay 5 -o "$HOME/.local/bin/sdlc" \
+            "https://github.com/sdlcworks/public-releases/releases/download/${CLI_VERSION}/${BINARY_NAME}"
+          chmod +x "$HOME/.local/bin/sdlc"
+          echo "✓ sdlc $CLI_VERSION installed"
+        env:
+          CLI_VERSION: ${{ github.event.inputs.cli_version }}
+
+      - name: Install SCR (sdlc-components-run)
+        run: |
+          set -euo pipefail
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; esac
+          mkdir -p "$HOME/.local/bin"
+          curl -fL --retry 6 --retry-all-errors --retry-delay 5 -o "$HOME/.local/bin/sdlc-components-run.mjs" \
+            "https://github.com/sdlcworks/public-releases/releases/download/${SCR_VERSION}/components-run-default"
+          chmod +x "$HOME/.local/bin/sdlc-components-run.mjs"
+          ln -sf "$HOME/.local/bin/sdlc-components-run.mjs" "$HOME/.local/bin/sdlc-components-run"
+          echo "✓ sdlc-components-run $SCR_VERSION installed"
+        env:
+          SCR_VERSION: ${{ github.event.inputs.scr_version }}
+
+      - name: Install SCB (sdlc-components-build)
+        run: |
+          set -euo pipefail
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; esac
+          mkdir -p "$HOME/.local/bin"
+          curl -fL --retry 6 --retry-all-errors --retry-delay 5 -o "$HOME/.local/bin/sdlc-components-build" \
+            "https://github.com/sdlcworks/public-releases/releases/download/${SCB_VERSION}/components-build-default"
+          chmod +x "$HOME/.local/bin/sdlc-components-build"
+          echo "✓ sdlc-components-build $SCB_VERSION installed"
+        env:
+          SCB_VERSION: ${{ github.event.inputs.scb_version }}
+
+      - name: Pull bare clones
+        continue-on-error: true
+        run: sdlc code pull
+        env:
+          SDLC_CONFIG_API_URL: ${{ github.event.inputs.app_api_url }}
+          SDLC_CONFIG_API_SECRET: ${{ secrets.APP_API_SECRET }}
+          SDLC_CONFIG_PROJECT: ${{ github.event.inputs.project_name }}
+          SDLC_CONFIG_BRANCH: ${{ github.event.inputs.branch_name }}
+          API_CLIENT_MODE: false
+
+      - name: Pin worktrees
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ -z "$COMMITS" ]; then
+            echo "::error::component_commits is empty"
+            exit 1
+          fi
+          # Empty positional args → pin every component on the branch that
+          # has an entry in the commits JSON. The CLI groups by repo,
+          # reuses one auth envelope per repo, and aggregates outcomes.
+          sdlc code worktree add --commits "$COMMITS"
+        env:
+          COMMITS: ${{ github.event.inputs.component_commits }}
+          SDLC_CONFIG_API_URL: ${{ github.event.inputs.app_api_url }}
+          SDLC_CONFIG_API_SECRET: ${{ secrets.APP_API_SECRET }}
+          SDLC_CONFIG_PROJECT: ${{ github.event.inputs.project_name }}
+          SDLC_CONFIG_BRANCH: ${{ github.event.inputs.branch_name }}
+          API_CLIENT_MODE: false
+
+      - name: Materialize store workspaces
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          STORE_GROUPS=$(echo "$COMMITS" | jq -c '[to_entries[] | select((.value.source_kind // "repository") == "store")] | group_by(.value.integration + "@" + .value.identity) | map(.[0].value)')
+          COUNT=$(echo "$STORE_GROUPS" | jq 'length')
+          IDX=0
+          while [ "$IDX" -lt "$COUNT" ]; do
+            G=$(echo "$STORE_GROUPS" | jq -c ".[$IDX]")
+            IDX=$((IDX+1))
+            sdlc store-workspace materialize \
+              --integration "$(echo "$G" | jq -r '.integration')" \
+              --region-root "$(echo "$G" | jq -r '.region_root // ""')" \
+              --identity "$(echo "$G" | jq -r '.identity')"
+          done
+        env:
+          COMMITS: ${{ github.event.inputs.component_commits }}
+          SDLC_CONFIG_API_URL: ${{ github.event.inputs.app_api_url }}
+          SDLC_CONFIG_API_SECRET: ${{ secrets.APP_API_SECRET }}
+          SDLC_CONFIG_PROJECT: ${{ github.event.inputs.project_name }}
+          SDLC_CONFIG_BRANCH: ${{ github.event.inputs.branch_name }}
+          API_CLIENT_MODE: false
+
+      - name: Run stack sync
+        # NOTE: The release template (sdlc.release.yaml) still has an @infra
+        # stop-gap for the publisher's bun install. This is NOT on the critical
+        # path for centralised infra (builds use sdlc.build.yaml, provisions use
+        # this template). If @infra-components ever needs to participate in the
+        # release flow, the release template will need the same dynamic treatment.
+        run: |
+          set -euo pipefail
+          # `sdlc code pull` + `sdlc code worktree add` materialise the workspace
+          # under <cwd>/<repo_name>/<short_sha>/ (per the code-subsystem layout
+          # convention). `sdlc provision` is source-driven — it reads sdlc.toml
+          # from the current worktree directory to discover infra-code dirs.
+          # Each infra-code component has its own worktree and its own Pulumi stack;
+          # provisions are sequential and independent with no shared state.
+          INFRA_COMPONENTS=$(echo "$INFRA_CODE_COMPONENTS" | jq -r '.[]' 2>/dev/null || true)
+          if [ -z "$INFRA_COMPONENTS" ]; then
+            echo "::warning::No infra_code_components provided; falling back to @infra"
+            INFRA_COMPONENTS="@infra"
+          fi
+          for COMPONENT in $INFRA_COMPONENTS; do
+            SK=$(echo "$COMMITS" | jq -r --arg c "$COMPONENT" '.[$c].source_kind // "repository"')
+            if [ "$SK" = "store" ]; then
+              worktree="store/$(echo "$COMMITS" | jq -r --arg c "$COMPONENT" '.[$c].identity' | sed 's/^sha256://' | cut -c1-12)"
+            else
+              NAME=$(echo "$COMMITS" | jq -r --arg c "$COMPONENT" '.[$c].repo_name')
+              SHORT=$(echo "$COMMITS" | jq -r --arg c "$COMPONENT" '.[$c].commit[0:7]')
+              if [ "$NAME" = "null" ] || [ -z "$NAME" ]; then
+                echo "::warning::Component $COMPONENT not found in component_commits; skipping"
+                continue
+              fi
+              worktree="${NAME}/${SHORT}"
+            fi
+            echo "-> Running provision in ${worktree} (component: ${COMPONENT})"
+            cd "${worktree}"
+            sdlc provision
+            cd -
+          done
+        env:
+          COMMITS: ${{ github.event.inputs.component_commits }}
+          INFRA_CODE_COMPONENTS: ${{ github.event.inputs.infra_code_components }}
+          SDLC_CONFIG_API_URL: ${{ github.event.inputs.app_api_url }}
+          SDLC_CONFIG_API_SECRET: ${{ secrets.APP_API_SECRET }}
+          SDLC_CONFIG_PROJECT: ${{ github.event.inputs.project_name }}
+          SDLC_CONFIG_BRANCH: ${{ github.event.inputs.branch_name }}
+          API_CLIENT_MODE: false
