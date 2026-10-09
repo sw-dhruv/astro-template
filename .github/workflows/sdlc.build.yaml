@@ -1,0 +1,293 @@
+name: sdlc:build
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_api_url:
+        description: "App API URL"
+        type: string
+        required: true
+      cli_version:
+        description: "sdlc CLI release tag"
+        type: string
+        required: true
+      scr_version:
+        description: "sdlc-components-run release tag"
+        type: string
+        required: true
+      scb_version:
+        description: "sdlc-components-build release tag"
+        type: string
+        required: true
+      components:
+        description: "Build targets (comma-separated; component or component:label, leave empty for all)"
+        type: string
+        required: false
+        default: ""
+      component_commits:
+        description: 'Per-component repo + commit to pin (JSON: {"<component>":{"repo_owner":"","repo_name":"","commit":""}})'
+        type: string
+        required: true
+      upload:
+        description: "Upload artifacts to registry after build"
+        type: boolean
+        required: false
+        default: false
+      project_name:
+        description: "Project Name"
+        type: string
+        required: true
+        default: ""
+      branch_name:
+        description: "Branch Name"
+        type: string
+        required: true
+        default: ""
+
+permissions:
+  actions: write
+  contents: write
+  deployments: write
+  pull-requests: write
+  packages: write
+
+jobs:
+  # Job 1: Resolve the build matrix. Filters component_commits by the caller's
+  # components input, groups entries by unique (repo_owner, repo_name, commit),
+  # and emits a JSON array as a job output. The build job expands this array
+  # into one parallel sibling job per group, and a group naming several
+  # build targets into one job per target — each with its own live log tab.
+  compute-matrix:
+    name: Compute build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      count: ${{ steps.build.outputs.count }}
+    steps:
+      - name: Resolve groups
+        id: build
+        run: |
+          set -euo pipefail
+          COMMITS='${{ github.event.inputs.component_commits }}'
+          COMPONENTS_INPUT="${{ github.event.inputs.components }}"
+
+          if [ -z "$COMMITS" ]; then
+            echo "::error::component_commits is empty"
+            exit 1
+          fi
+
+          # Build-target members are `component` or `component:label`. Source
+          # work (commit filtering, worktree materialization) uses only the
+          # component projection — a label selects build outputs, never source.
+          # Targets keep authored granularity for the per-group `sdlc build`.
+          JQ_PROJECTION_PROGRAM='$list | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | map(split(":")[0]) | unique'
+          JQ_GROUPS_PROGRAM='($list | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $members | def targetsof($comps): (if ($members | length) == 0 then ($comps | join(" ")) else ([$members[] | select((split(":")[0]) as $c | $comps | index($c))] | join(" ")) end); [ to_entries | group_by(if (.value.source_kind // "repository") == "store" then "store:" + .value.integration + "@" + .value.identity else "repo:" + .value.repo_owner + "/" + .value.repo_name + "@" + .value.commit end) | .[] | ([.[].key]) as $comps | (.[0].value) as $v | if ($v.source_kind // "repository") == "store" then {source_kind: "store", integration: $v.integration, region_root: ($v.region_root // ""), identity: $v.identity, repo_name: "store", short_sha: ($v.identity | sub("^sha256:"; "") | .[0:12]), workdir: ("store/" + ($v.identity | sub("^sha256:"; "") | .[0:12])), components: ($comps | join(" ")), targets: targetsof($comps)} else {source_kind: "repository", repo_owner: $v.repo_owner, repo_name: $v.repo_name, commit: $v.commit, short_sha: ($v.commit[0:7]), workdir: ($v.repo_name + "/" + ($v.commit[0:7])), components: ($comps | join(" ")), targets: targetsof($comps)} end ] | [ .[] | . as $g | ($g.targets | split(" ") | map(select(length > 0))) as $ts | if ($ts | length) > 1 then ($ts[] | $g + {targets: .}) else $g end ]'
+
+          # Filter to the projection if a selection was provided; otherwise keep all.
+          if [ -n "$COMPONENTS_INPUT" ]; then
+            PROJECTION=$(jq -cn --arg list "$COMPONENTS_INPUT" "$JQ_PROJECTION_PROGRAM")
+            FILTERED=$(echo "$COMMITS" | jq -c --argjson want "$PROJECTION" 'with_entries(select(.key as $k | $want | index($k)))')
+          else
+            FILTERED=$(echo "$COMMITS" | jq -c '.')
+          fi
+
+          # Group by (owner, name, commit) into one matrix entry per group.
+          # components is the bare space-separated projection (materialization);
+          # targets is the authored-granularity subset for `sdlc build`.
+          MATRIX=$(echo "$FILTERED" | jq -c --arg list "$COMPONENTS_INPUT" "$JQ_GROUPS_PROGRAM")
+          COUNT=$(echo "$MATRIX" | jq 'length')
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No build groups resolved from component_commits + components filter"
+            exit 1
+          fi
+
+          echo "Resolved $COUNT build group(s):"
+          echo "$MATRIX" | jq .
+
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+  # Job 2: One parallel job per (repo_owner, repo_name, commit, target). Each
+  # job owns its own runner, its own live log tab in the UI, and fails
+  # independently of siblings (fail-fast: false).
+  build:
+    name: build (${{ matrix.group.repo_name }}@${{ matrix.group.short_sha }} ${{ matrix.group.targets }})
+    needs: compute-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.compute-matrix.outputs.matrix) }}
+    steps:
+      - name: Job Parameters
+        run: |
+          echo "========================================="
+          echo "Run ID:     ${{ github.run_id }}"
+          echo "Repo:       ${{ matrix.group.repo_owner }}/${{ matrix.group.repo_name }}"
+          echo "Commit:     ${{ matrix.group.commit }}"
+          echo "Short SHA:  ${{ matrix.group.short_sha }}"
+          echo "Components: ${{ matrix.group.components }}"
+          echo "Upload:     ${{ github.event.inputs.upload }}"
+          echo "========================================="
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Cache Nix store
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Verify Nix Installation
+        run: |
+          echo "Nix installed successfully"
+          nix --version
+
+      - name: Enable containerd image store for multi-arch
+        run: |
+          echo '{"features":{"containerd-snapshotter":true}}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af
+          df -h /
+
+      - name: Cache sdlc CLI binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/sdlc
+          key: sdlc-cli-${{ runner.os }}-${{ runner.arch }}-${{ github.event.inputs.cli_version }}
+
+      - name: Install sdlc CLI
+        run: |
+          set -euo pipefail
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; esac
+          BINARY_NAME="cli-${OS}-${ARCH}"
+          mkdir -p "$HOME/.local/bin"
+          if [ ! -f "$HOME/.local/bin/sdlc" ]; then
+            curl -fL --retry 6 --retry-all-errors --retry-delay 5 -o "$HOME/.local/bin/sdlc" \
+              "https://github.com/sdlcworks/public-releases/releases/download/${CLI_VERSION}/${BINARY_NAME}"
+          fi
+          chmod +x "$HOME/.local/bin/sdlc"
+          echo "✓ sdlc $CLI_VERSION installed"
+        env:
+          CLI_VERSION: ${{ github.event.inputs.cli_version }}
+
+      - name: Cache SCR binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/sdlc-components-run.mjs
+          key: sdlc-scr-${{ runner.os }}-${{ runner.arch }}-${{ github.event.inputs.scr_version }}
+
+      - name: Install SCR (sdlc-components-run)
+        run: |
+          set -euo pipefail
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; esac
+          mkdir -p "$HOME/.local/bin"
+          if [ ! -f "$HOME/.local/bin/sdlc-components-run.mjs" ]; then
+            curl -fL --retry 6 --retry-all-errors --retry-delay 5 -o "$HOME/.local/bin/sdlc-components-run.mjs" \
+              "https://github.com/sdlcworks/public-releases/releases/download/${SCR_VERSION}/components-run-default"
+          fi
+          chmod +x "$HOME/.local/bin/sdlc-components-run.mjs"
+          ln -sf "$HOME/.local/bin/sdlc-components-run.mjs" "$HOME/.local/bin/sdlc-components-run"
+          echo "✓ sdlc-components-run $SCR_VERSION installed"
+        env:
+          SCR_VERSION: ${{ github.event.inputs.scr_version }}
+
+      - name: Cache SCB binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/sdlc-components-build
+          key: sdlc-scb-${{ runner.os }}-${{ runner.arch }}-${{ github.event.inputs.scb_version }}
+
+      - name: Install SCB (sdlc-components-build)
+        run: |
+          set -euo pipefail
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; esac
+          mkdir -p "$HOME/.local/bin"
+          if [ ! -f "$HOME/.local/bin/sdlc-components-build" ]; then
+            curl -fL --retry 6 --retry-all-errors --retry-delay 5 -o "$HOME/.local/bin/sdlc-components-build" \
+              "https://github.com/sdlcworks/public-releases/releases/download/${SCB_VERSION}/components-build-default"
+          fi
+          chmod +x "$HOME/.local/bin/sdlc-components-build"
+          echo "✓ sdlc-components-build $SCB_VERSION installed"
+        env:
+          SCB_VERSION: ${{ github.event.inputs.scb_version }}
+
+      - name: Pull bare clone
+        if: ${{ matrix.group.source_kind != 'store' }}
+        run: |
+          set -euo pipefail
+          # Components is space-separated; positional args naturally split.
+          sdlc code pull $COMPONENTS
+        env:
+          COMPONENTS: ${{ matrix.group.components }}
+          SDLC_CONFIG_API_URL: ${{ github.event.inputs.app_api_url }}
+          SDLC_CONFIG_API_SECRET: ${{ secrets.APP_API_SECRET }}
+          SDLC_CONFIG_PROJECT: ${{ github.event.inputs.project_name }}
+          SDLC_CONFIG_BRANCH: ${{ github.event.inputs.branch_name }}
+          API_CLIENT_MODE: false
+
+      - name: Pin worktree
+        if: ${{ matrix.group.source_kind != 'store' }}
+        run: |
+          set -euo pipefail
+          # Components in this matrix group share one commit. The CLI treats
+          # positional args as the selector and picks matching entries out of
+          # the full component_commits JSON; repo identity is resolved from
+          # the roster, so only .commit is read per entry.
+          sdlc code worktree add $COMPONENTS --commits "$COMMITS"
+        env:
+          COMPONENTS: ${{ matrix.group.components }}
+          COMMITS: ${{ github.event.inputs.component_commits }}
+          SDLC_CONFIG_API_URL: ${{ github.event.inputs.app_api_url }}
+          SDLC_CONFIG_API_SECRET: ${{ secrets.APP_API_SECRET }}
+          SDLC_CONFIG_PROJECT: ${{ github.event.inputs.project_name }}
+          SDLC_CONFIG_BRANCH: ${{ github.event.inputs.branch_name }}
+          API_CLIENT_MODE: false
+
+      - name: Materialize store workspace
+        if: ${{ matrix.group.source_kind == 'store' }}
+        run: |
+          set -euo pipefail
+          sdlc store-workspace materialize --integration "$INTEGRATION" --region-root "$REGION_ROOT" --identity "$IDENTITY"
+        env:
+          INTEGRATION: ${{ matrix.group.integration }}
+          REGION_ROOT: ${{ matrix.group.region_root }}
+          IDENTITY: ${{ matrix.group.identity }}
+          SDLC_CONFIG_API_URL: ${{ github.event.inputs.app_api_url }}
+          SDLC_CONFIG_API_SECRET: ${{ secrets.APP_API_SECRET }}
+          SDLC_CONFIG_PROJECT: ${{ github.event.inputs.project_name }}
+          SDLC_CONFIG_BRANCH: ${{ github.event.inputs.branch_name }}
+          API_CLIENT_MODE: false
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          UPLOAD_FLAG=""
+          if [ "$UPLOAD" = "true" ]; then
+            UPLOAD_FLAG="--upload"
+          fi
+          worktree="${WORKDIR}"
+          echo "→ Building [${TARGETS}] in ${worktree}"
+          cd "${worktree}"
+          sdlc build $TARGETS $UPLOAD_FLAG
+        env:
+          WORKDIR: ${{ matrix.group.workdir }}
+          TARGETS: ${{ matrix.group.targets }}
+          UPLOAD: ${{ github.event.inputs.upload }}
+          SDLC_CONFIG_API_URL: ${{ github.event.inputs.app_api_url }}
+          SDLC_CONFIG_API_SECRET: ${{ secrets.APP_API_SECRET }}
+          SDLC_CONFIG_PROJECT: ${{ github.event.inputs.project_name }}
+          SDLC_CONFIG_BRANCH: ${{ github.event.inputs.branch_name }}
+          API_CLIENT_MODE: false
