@@ -1,0 +1,179 @@
+name: sdlc:release
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_api_url:
+        description: "App API URL"
+        type: string
+        required: true
+      cli_version:
+        description: "sdlc CLI release tag"
+        type: string
+        required: true
+      scr_version:
+        description: "sdlc-components-run release tag"
+        type: string
+        required: true
+      scb_version:
+        description: "Legacy component builder release tag"
+        type: string
+        required: true
+      component_versions:
+        description: "Component versions as JSON map (e.g. {\"api\":\"1.2.3\",\"web\":\"2.0.0\"})"
+        type: string
+        required: false
+      components:
+        description: "Components to release (space-separated, leave empty for all branch components)"
+        type: string
+        required: false
+        default: ""
+      artifacts:
+        description: "Artifact pins per component as JSON map: {\"<component>\":{\"<label>\":\"<artifact_id>\"}} (leave empty for newest)"
+        type: string
+        required: false
+        default: ""
+      project_name:
+        description: "Project Name"
+        type: string
+        required: true
+      branch_name:
+        description: "Branch Name"
+        type: string
+        required: true
+
+permissions:
+  actions: write
+  contents: write
+  deployments: write
+  pull-requests: write
+  packages: write
+
+jobs:
+  release:
+    name: SDLC Release
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Install Bun
+        # The local-fallback path runs `sdlc-components-build` directly, which
+        # has a `#!/usr/bin/env bun` shebang. Without bun on PATH the runner
+        # exits with `/usr/bin/env: 'bun': No such file or directory`. Same
+        # bun-version pin as cli-release.yml.
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.2.2'
+
+      - name: Job Parameters
+        run: |
+          echo "========================================="
+          echo "SDLC Release Job Started"
+          echo "========================================="
+          echo "Run ID: ${{ github.run_id }}"
+          echo "App API URL: ${{ github.event.inputs.app_api_url }}"
+          echo "CLI Version: ${{ github.event.inputs.cli_version }}"
+          echo "Component Versions: ${{ github.event.inputs.component_versions }}"
+          echo "Project: ${{ github.event.inputs.project_name }}"
+          echo "Branch: ${{ github.event.inputs.branch_name }}"
+          echo "========================================="
+
+      - name: Install sdlc CLI
+        run: |
+          set -euo pipefail
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; esac
+          BINARY_NAME="cli-${OS}-${ARCH}"
+          mkdir -p "$HOME/.local/bin"
+          curl -fL --retry 6 --retry-all-errors --retry-delay 5 -o "$HOME/.local/bin/sdlc" \
+            "https://github.com/sdlcworks/public-releases/releases/download/${CLI_VERSION}/${BINARY_NAME}"
+          chmod +x "$HOME/.local/bin/sdlc"
+          echo "✓ sdlc $CLI_VERSION installed"
+        env:
+          CLI_VERSION: ${{ github.event.inputs.cli_version }}
+
+      - name: Install SCR (sdlc-components-run)
+        run: |
+          set -euo pipefail
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; esac
+          mkdir -p "$HOME/.local/bin"
+          curl -fL --retry 6 --retry-all-errors --retry-delay 5 -o "$HOME/.local/bin/sdlc-components-run.mjs" \
+            "https://github.com/sdlcworks/public-releases/releases/download/${SCR_VERSION}/components-run-default"
+          chmod +x "$HOME/.local/bin/sdlc-components-run.mjs"
+          ln -sf "$HOME/.local/bin/sdlc-components-run.mjs" "$HOME/.local/bin/sdlc-components-run"
+          echo "✓ sdlc-components-run $SCR_VERSION installed"
+        env:
+          SCR_VERSION: ${{ github.event.inputs.scr_version }}
+
+      - name: Release Components
+        run: |
+          set -uo pipefail
+          echo "========================================="
+          echo "Release Execution"
+          echo "========================================="
+
+          COMPONENT_VERSIONS_JSON='${{ github.event.inputs.component_versions }}'
+          ARTIFACTS_JSON='${{ github.event.inputs.artifacts }}'
+          COMPONENTS_INPUT='${{ github.event.inputs.components }}'
+
+          # COMPONENTS_INPUT is space-separated; passed as positional args to sdlc release
+          # to scope the release. Empty = all branch components (CLI default).
+          # shellcheck disable=SC2086
+          set -- $COMPONENTS_INPUT
+
+          echo "Components scope: ${COMPONENTS_INPUT:-<all>}"
+          echo "Component Versions: ${COMPONENT_VERSIONS_JSON:-<auto>}"
+          echo "Artifacts: ${ARTIFACTS_JSON:-<newest>}"
+          echo "========================================="
+
+          # Always pass --auto. The CLI composes inputs:
+          #   --component-versions covers explicitly-named components (with version_file fallback).
+          #   --auto mints versions for the residue (in scope but not in the explicit map).
+          # When the explicit map is empty, every in-scope component is auto-minted.
+          # When the map covers every in-scope component, --auto is a no-op for versions.
+          # --artifacts pins artifact UUIDs; absent → CLI auto-selects newest per (component, label).
+          ARGS=(--non-interactive --auto)
+          if [ -n "$COMPONENT_VERSIONS_JSON" ]; then
+            ARGS+=(--component-versions="$COMPONENT_VERSIONS_JSON")
+          fi
+          if [ -n "$ARTIFACTS_JSON" ]; then
+            ARGS+=(--artifacts="$ARTIFACTS_JSON")
+          fi
+          sdlc release "${ARGS[@]}" "$@"
+
+          RELEASE_EXIT_CODE=$?
+
+          echo "========================================="
+          if [ $RELEASE_EXIT_CODE -eq 0 ]; then
+            echo "✅ Release completed successfully"
+            exit 0
+          else
+            echo "❌ Release failed with exit code: $RELEASE_EXIT_CODE"
+            exit $RELEASE_EXIT_CODE
+          fi
+        env:
+          SDLC_CONFIG_API_URL: ${{ github.event.inputs.app_api_url }}
+          SDLC_CONFIG_API_SECRET: ${{ secrets.APP_API_SECRET }}
+          SDLC_CONFIG_PROJECT: ${{ github.event.inputs.project_name }}
+          SDLC_CONFIG_BRANCH: ${{ github.event.inputs.branch_name }}
+          API_CLIENT_MODE: false
+
+      - name: Release Summary
+        if: always()
+        run: |
+          echo "========================================="
+          echo "Release Workflow Summary"
+          echo "========================================="
+          echo "Status: ${{ job.status }}"
+          echo "Component Versions: ${{ github.event.inputs.component_versions }}"
+          echo "Components: ${{ github.event.inputs.components }}"
+          echo "Artifacts: ${{ github.event.inputs.artifacts }}"
+          echo "========================================="
+
+          if [ "${{ job.status }}" != "success" ]; then
+            echo "⚠️  Check logs above for error details"
+            exit 1
+          fi
